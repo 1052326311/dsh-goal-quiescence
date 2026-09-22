@@ -76,4 +76,10 @@ completes the unchanged goal revision.
 ```sh
 pnpm test
 pnpm check
+pnpm run smoke:package
 ```
+
+The package smoke test installs the packed artifact into an isolated temporary
+DSH home, boots the real Web profile on DSH `0.1.6-alpha.2`, and verifies that
+both goal-quiescence tools are registered. Its JSON result records the package
+SHA-256, DSH version, Node version, profile, tool names, and HTTP status.
