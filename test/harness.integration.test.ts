@@ -8,7 +8,7 @@ import { carrierKeyOf } from '@deepseek-ai/dsh-scope'
 import SubagentRuntime, { type SubagentResult, type SubagentRun } from '@deepseek-ai/dsh-subagent'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import * as ToolGoal from '@deepseek-ai/dsh-tool-goal'
-import ToolRuntime, { type ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import ToolRuntime, { type ToolExecutionResult, type ToolExecutionToken } from '@deepseek-ai/dsh-tools'
 import { apply } from '../src/index.js'
 
 interface StubAgent {
@@ -48,19 +48,45 @@ function openHumanTurn(root: StubAgent): void {
   for (const admitted of claimed) root.session.append('user/message', admitted, { surfaceOp: 'append' })
 }
 
-function resultValue(result: ToolExecutionResult): Record<string, unknown> {
-  expect(result.isError).toBe(false)
-  if (result.isError || !result.value || typeof result.value !== 'object') throw new Error('expected successful JSON result')
-  return result.value as Record<string, unknown>
+function resultText(result: ToolExecutionResult): string {
+  return result.content
+    .filter(block => block.type === 'text')
+    .map(block => block.text)
+    .join('\n')
 }
 
-async function execute(ctx: Context, root: Agent, name: string, args: unknown): Promise<ToolExecutionResult> {
+function contentText(result: ToolExecutionResult): string {
+  expect(result.isError).toBe(false)
+  if (result.isError) throw new Error('expected successful tool result')
+  return resultText(result)
+}
+
+function statusRunId(content: string): string {
+  const marker = 'Pending subagent runs:\n'
+  const markerIndex = content.indexOf(marker)
+  if (markerIndex < 0) throw new Error('expected rendered pending subagent runs')
+  const rendered = JSON.parse(content.slice(markerIndex + marker.length)) as {
+    pending?: Array<{ runId?: unknown }>
+  }
+  const runId = rendered.pending?.[0]?.runId
+  if (typeof runId !== 'string') throw new Error('expected rendered runId')
+  return runId
+}
+
+async function execute(
+  ctx: Context,
+  root: Agent,
+  name: string,
+  args: unknown,
+  parent?: ToolExecutionToken,
+): Promise<ToolExecutionResult> {
   return ctx.agents.withInitiator(root, () => ctx.tools.execute({
     signal: new AbortController().signal,
     callId: CallId(`call-${Math.random()}`),
     name,
     arguments: args,
     agent: root,
+    ...(parent === undefined ? {} : { parent }),
   }))
 }
 
@@ -74,6 +100,15 @@ describe('goal quiescence lifecycle guard', () => {
     await ctx.plugin(SubagentRuntime)
     await ctx.plugin(ToolGoal)
     apply(ctx)
+
+    let acknowledgementPolicy: 'accept' | 'block' | 'replace' = 'accept'
+    ctx.on('tools/post-execute', async (exec, _result, next) => {
+      if (exec.name !== 'goal_quiescence_ack' || acknowledgementPolicy === 'accept') return next()
+      if (acknowledgementPolicy === 'block') {
+        return { kind: 'block' as const, feedback: [{ type: 'text' as const, text: 'Blocked by output policy' }] }
+      }
+      return { kind: 'accept' as const, content: [{ type: 'text' as const, text: 'Acknowledgement evidence replaced' }] }
+    })
 
     const root = stubAgent('root-goal')
     ctx.agents.register(root.agent)
@@ -129,15 +164,53 @@ describe('goal quiescence lifecycle guard', () => {
     expect(afterSettlement.isError).toBe(true)
     expect(JSON.stringify(afterSettlement.content)).toContain('settled result')
 
-    const status = resultValue(await execute(ctx, root.agent, 'goal_quiescence_status', {}))
-    const pending = status.pending as Array<{ runId: string; phase: string }>
-    expect(pending).toHaveLength(1)
-    expect(pending[0]).toMatchObject({ phase: 'settled' })
+    const statusResult = await execute(ctx, root.agent, 'goal_quiescence_status', {})
+    const statusContent = contentText(statusResult)
+    expect(statusContent).toContain('"phase":"settled"')
+    const runId = statusRunId(statusContent)
 
-    const acknowledgementResult = await execute(ctx, root.agent, 'goal_quiescence_ack', { run_id: pending[0].runId })
-    const acknowledged = resultValue(acknowledgementResult)
-    expect(JSON.stringify(acknowledged)).toContain('CHILD_REVIEW_SENTINEL')
-    expect(JSON.stringify(acknowledgementResult.content)).toContain('CHILD_REVIEW_SENTINEL')
+    const nestedAcknowledgement = await execute(
+      ctx,
+      root.agent,
+      'goal_quiescence_ack',
+      { run_id: runId },
+      Symbol('nested-transport') as ToolExecutionToken,
+    )
+    expect(nestedAcknowledgement.isError).toBe(true)
+    expect(resultText(nestedAcknowledgement)).toContain('must be called directly')
+    expect(statusRunId(contentText(await execute(ctx, root.agent, 'goal_quiescence_status', {})))).toBe(runId)
+
+    acknowledgementPolicy = 'block'
+    const blockedAcknowledgement = await execute(ctx, root.agent, 'goal_quiescence_ack', { run_id: runId })
+    expect(blockedAcknowledgement.isError).toBe(true)
+    expect(resultText(blockedAcknowledgement)).toContain('Blocked by output policy')
+    expect(statusRunId(contentText(await execute(ctx, root.agent, 'goal_quiescence_status', {})))).toBe(runId)
+
+    const afterBlockedAcknowledgement = await execute(ctx, root.agent, 'update_goal', {
+      goal_id: goal.id,
+      revision: goal.revision,
+      action: 'complete',
+    })
+    expect(afterBlockedAcknowledgement.isError).toBe(true)
+
+    acknowledgementPolicy = 'replace'
+    const replacedAcknowledgement = await execute(ctx, root.agent, 'goal_quiescence_ack', { run_id: runId })
+    expect(replacedAcknowledgement.isError).toBe(false)
+    expect(contentText(replacedAcknowledgement)).toBe('Acknowledgement evidence replaced')
+    expect(statusRunId(contentText(await execute(ctx, root.agent, 'goal_quiescence_status', {})))).toBe(runId)
+
+    const afterReplacedAcknowledgement = await execute(ctx, root.agent, 'update_goal', {
+      goal_id: goal.id,
+      revision: goal.revision,
+      action: 'complete',
+    })
+    expect(afterReplacedAcknowledgement.isError).toBe(true)
+
+    acknowledgementPolicy = 'accept'
+    const acknowledgementResult = await execute(ctx, root.agent, 'goal_quiescence_ack', { run_id: runId })
+    const acknowledgementContent = contentText(acknowledgementResult)
+    expect(acknowledgementContent).toContain('Stop reason: completed')
+    expect(acknowledgementContent).toContain('CHILD_REVIEW_SENTINEL')
 
     const complete = await execute(ctx, root.agent, 'update_goal', {
       goal_id: goal.id,
@@ -146,5 +219,48 @@ describe('goal quiescence lifecycle guard', () => {
     })
     expect(complete.isError).toBe(false)
     expect(ctx.goals.get(root.agent)?.phase).toBe('complete')
+  })
+
+  it('surfaces an error stop reason when a settled child has no terminal assistant output', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(GoalService)
+    await ctx.plugin(SubagentRuntime)
+    await ctx.plugin(ToolGoal)
+    apply(ctx)
+
+    const root = stubAgent('root-no-output')
+    ctx.agents.register(root.agent)
+    ctx.goals.create(root.agent, { objective: 'Inspect failed child evidence' })
+    openHumanTurn(root)
+
+    ctx.subagents.registerProvider({
+      name: 'failed-without-output',
+      capabilities: { outputSchema: false, depthLimit: false, toolFilter: false, persona: false },
+      inheritsParentContext: false,
+      start: async () => ({
+        id: SessionId('child-no-output'),
+        localAgent: undefined,
+        result: Promise.resolve({ output: [], stopReason: 'error' }),
+        dispose: async () => {},
+      }),
+    })
+
+    const run = await ctx.subagents.start('failed-without-output', {
+      parent: root.agent,
+      prompt: [{ type: 'text', text: 'Inspect the failed operation.' }],
+      signal: new AbortController().signal,
+    })
+    await run.result
+    await Promise.resolve()
+
+    const status = contentText(await execute(ctx, root.agent, 'goal_quiescence_status', {}))
+    const acknowledgement = contentText(await execute(ctx, root.agent, 'goal_quiescence_ack', {
+      run_id: statusRunId(status),
+    }))
+    expect(acknowledgement).toContain('Stop reason: error')
+    expect(acknowledgement).toContain('No terminal assistant output was reported.')
   })
 })

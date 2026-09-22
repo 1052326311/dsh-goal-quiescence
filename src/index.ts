@@ -34,6 +34,11 @@ interface CompleteArgs {
   readonly action?: unknown
 }
 
+interface PendingAcknowledgement extends GoalKey {
+  readonly runId: string
+  readonly value: Record<string, unknown>
+}
+
 function json(value: unknown): never {
   return value as never
 }
@@ -58,9 +63,15 @@ function equalGoal(left: GoalKey, right: GoalKey): boolean {
   return left.rootId === right.rootId && left.goalId === right.goalId
 }
 
-function outputText(_args: unknown, value: unknown): { type: 'text'; text: string }[] {
+function statusOutput(_args: unknown, value: unknown): { type: 'text'; text: string }[] {
   const record = isRecord(value) ? value : {}
-  return [{ type: 'text', text: typeof record.message === 'string' ? record.message : 'Goal quiescence updated.' }]
+  const message = typeof record.message === 'string' ? record.message : 'Goal quiescence status unavailable.'
+  const pending = Array.isArray(record.pending) ? record.pending : []
+  const omitted = typeof record.omitted === 'number' ? record.omitted : 0
+  return [{
+    type: 'text',
+    text: `${message}\n\nPending subagent runs:\n${JSON.stringify({ pending, omitted })}`,
+  }]
 }
 
 function acknowledgementOutput(_args: unknown, value: unknown): { type: 'text'; text: string }[] {
@@ -68,16 +79,25 @@ function acknowledgementOutput(_args: unknown, value: unknown): { type: 'text'; 
   const run = isRecord(record.run) ? record.run : {}
   const terminal = Array.isArray(run.lastAssistantMessage) ? run.lastAssistantMessage : []
   const message = typeof record.message === 'string' ? record.message : 'Goal quiescence acknowledged a subagent run.'
+  const stopReason = typeof run.stopReason === 'string' ? run.stopReason : 'not reported'
+  const terminalText = terminal.length > 0
+    ? JSON.stringify(terminal)
+    : 'No terminal assistant output was reported.'
   return [{
     type: 'text',
-    text: `${message}\n\nTerminal subagent result:\n${JSON.stringify(terminal)}`,
+    text: `${message}\n\nStop reason: ${stopReason}\n\nTerminal subagent result:\n${terminalText}`,
   }]
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
 }
 
 /** Install the completion guard plus bounded status and terminal-evidence tools. */
 export function apply(ctx: Context): void {
   const runs = new Map<string, RunRecord>()
   const childGoals = new Map<string, GoalKey>()
+  const pendingAcknowledgements = new Map<symbol, PendingAcknowledgement>()
 
   function liveAgent(value: unknown): Agent | undefined {
     if (!isRecord(value) || !('id' in value)) return undefined
@@ -139,11 +159,25 @@ export function apply(ctx: Context): void {
     }
   })
 
+  ctx.on('tools/result', (exec, result) => {
+    if (exec.name !== 'goal_quiescence_ack') return
+    const candidate = pendingAcknowledgements.get(exec.token)
+    pendingAcknowledgements.delete(exec.token)
+    if (candidate === undefined || exec.parent !== undefined || exec.agent === undefined || result.isError) return
+    const key = goalKey(ctx, exec.agent)
+    const record = runs.get(candidate.runId)
+    if (key === undefined || !equalGoal(candidate, key) || record === undefined || !equalGoal(record, key)) return
+    if (!sameJson(result.value, candidate.value)) return
+    const expectedContent = acknowledgementOutput(exec.arguments, result.value)
+    if (!expectedContent.every(expected => result.content.some(actual => sameJson(actual, expected)))) return
+    record.acknowledged = true
+  })
+
   ctx.tools.register(defineTool({
     name: 'goal_quiescence_status',
     description: 'List this goal\'s observed subagent runs that still block completion. Use it before claiming a goal is complete.',
     parameters: {},
-    output: { schema: { type: 'json' }, render: outputText },
+    output: { schema: { type: 'json' }, render: statusOutput },
     execute(_args, exec) {
       if (exec.agent === undefined) throw new Error('goal quiescence requires an owning goal agent')
       const key = goalKey(ctx, exec.agent)
@@ -175,13 +209,13 @@ export function apply(ctx: Context): void {
     output: { schema: { type: 'json' }, render: acknowledgementOutput },
     execute(args, exec) {
       if (exec.agent === undefined) throw new Error('goal quiescence requires an owning goal agent')
+      if (exec.parent !== undefined) throw new Error('goal quiescence acknowledgement must be called directly so its evidence reaches the goal agent')
       const key = goalKey(ctx, exec.agent)
       if (key === undefined) throw new Error('goal quiescence requires a current non-complete goal')
       const record = runs.get(args.run_id)
       if (record === undefined || !equalGoal(record, key)) throw new Error('subagent run is not observed for this current goal')
       if (record.phase === 'running') throw new Error('subagent run is still running; wait before acknowledging its terminal result')
-      record.acknowledged = true
-      return Promise.resolve(json({
+      const value = {
         message: `Acknowledged settled subagent run ${record.runId}. Its terminal result is now in this goal agent's tool context.`,
         run: {
           runId: record.runId,
@@ -189,7 +223,9 @@ export function apply(ctx: Context): void {
           stopReason: record.stopReason,
           lastAssistantMessage: record.lastAssistantMessage ?? [],
         },
-      }))
+      }
+      pendingAcknowledgements.set(exec.token, { ...key, runId: record.runId, value })
+      return Promise.resolve(json(value))
     },
   }))
 }
