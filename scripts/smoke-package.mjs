@@ -5,7 +5,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const DSH_VERSION = '0.1.6-alpha.2'
-const DSH_ARGS = ['--yes', `@deepseek-ai/dsh@${DSH_VERSION}`]
 const PROFILE = 'web'
 const EXPECTED_TOOLS = ['goal_quiescence_ack', 'goal_quiescence_status']
 
@@ -13,8 +12,10 @@ function run(command, args, options) {
   const result = spawnSync(command, args, {
     encoding: 'utf8',
     maxBuffer: 16 * 1024 * 1024,
+    timeout: 120_000,
     ...options,
   })
+  if (result.error !== undefined) throw result.error
   if (result.status !== 0) {
     throw new Error([
       `${command} ${args.join(' ')} exited ${result.status ?? 'without a status'}`,
@@ -147,6 +148,7 @@ async function main() {
     const pack = JSON.parse(packJson)[0]
     const tarball = join(root, pack.filename)
     const home = join(root, 'home')
+    const runtime = join(root, 'runtime')
     const probeOutput = join(root, 'tool-schemas.json')
     const probe = await createProbe(root)
     const environment = {
@@ -156,17 +158,28 @@ async function main() {
       NO_COLOR: '1',
     }
 
-    run('npx', [...DSH_ARGS, 'plugin', '--profile', PROFILE, 'add', tarball], {
-      cwd: process.cwd(),
+    await mkdir(runtime)
+    await writeFile(join(runtime, 'package.json'), '{"private":true}\n')
+    console.error(`[smoke] installing @deepseek-ai/dsh@${DSH_VERSION}`)
+    run('npm', ['install', '--no-audit', '--no-fund', '--save-exact', `@deepseek-ai/dsh@${DSH_VERSION}`], {
+      cwd: runtime,
       env: environment,
     })
-    run('npx', [...DSH_ARGS, 'plugin', '--profile', PROFILE, 'add', probe], {
-      cwd: process.cwd(),
+    const dsh = join(runtime, 'node_modules', '.bin', process.platform === 'win32' ? 'dsh.cmd' : 'dsh')
+
+    console.error('[smoke] installing packed plugin and schema probe')
+    run(dsh, ['plugin', '--profile', PROFILE, 'add', tarball], {
+      cwd: runtime,
+      env: environment,
+    })
+    run(dsh, ['plugin', '--profile', PROFILE, 'add', probe], {
+      cwd: runtime,
       env: environment,
     })
 
-    server = spawn('npx', [...DSH_ARGS, '--profile', PROFILE, '--no-open', '--host', '127.0.0.1', '--port', '0'], {
-      cwd: process.cwd(),
+    console.error(`[smoke] booting ${PROFILE} profile`)
+    server = spawn(dsh, ['--profile', PROFILE, '--no-open', '--host', '127.0.0.1', '--port', '0'], {
+      cwd: runtime,
       detached: process.platform !== 'win32',
       env: environment,
       stdio: ['ignore', 'pipe', 'pipe'],
