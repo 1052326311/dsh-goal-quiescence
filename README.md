@@ -19,6 +19,12 @@ lifecycle pair. It then denies `update_goal(action=complete)` until:
    returns the run's terminal assistant output as its own tool result, making
    the evidence visible in the parent agent's current context.
 
+Acknowledgement commits only after the real ToolRuntime pipeline returns a
+successful top-level result that still contains the plugin's complete evidence
+block. A post-execute policy that blocks or replaces that content leaves the
+run pending, and nested transport calls are rejected because their output is
+not direct evidence in the parent agent's context.
+
 `goal_quiescence_status` gives a bounded list of the runs that still block
 completion. The plugin does not schedule, cancel, or retry children, and it
 does not replace Harness goal mode.
@@ -62,11 +68,18 @@ tool context before it releases completion. This prevents the specific
 The integration test mounts the real Harness `ToolRuntime`, `GoalService`, and
 `SubagentRuntime`. It starts a real runtime lifecycle through a deferred
 provider, proves completion is denied while the child is running, proves it is
-still denied after settlement but before acknowledgement, verifies the child
-output reaches the acknowledgement tool result, and finally completes the
-unchanged goal revision.
+still denied after settlement and after blocked, replaced, or nested
+acknowledgements, verifies the child output reaches the final acknowledgement
+tool result, covers failed children with no terminal output, and finally
+completes the unchanged goal revision.
 
 ```sh
 pnpm test
 pnpm check
+pnpm run smoke:package
 ```
+
+The package smoke test installs the packed artifact into an isolated temporary
+DSH home, boots the real Web profile on DSH `0.1.6-alpha.2`, and verifies that
+both goal-quiescence tools are registered. Its JSON result records the package
+SHA-256, DSH version, Node version, profile, tool names, and HTTP status.
